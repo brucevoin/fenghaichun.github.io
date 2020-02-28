@@ -7,12 +7,12 @@ description: >
 baseurl: "/" # the subpath of your site, e.g. /blog
 url: "" # the base hostname & protocol for your site
 twitter_username: # your Twitter username
-github_username: # your Github username
+github_username: fenghaichun# your Github username
 disqus_username: # your disqus username
 
 google-analytics: # add it if you have one
 
-skillstree: true # turn on or off the skills tree in about page
+skillstree: false # turn on or off the skills tree in about page
 
 # Build settings
 permalink: none
