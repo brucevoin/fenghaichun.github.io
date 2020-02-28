@@ -3,4 +3,6 @@
 ## this is test
 
 
-https://fenghaichun.github.io/test2
+[this is another test](https://fenghaichun.github.io/test2)
+
+
