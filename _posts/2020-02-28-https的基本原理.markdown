@@ -1,11 +1,11 @@
 ---
 layout: post
-title: "如何买到靠谱的药"
-subtitle: "以下内容不适合信奉中医的人士阅读"
+title: "https基本原理"
+subtitle: ""
 date: 2020-02-28
 author: fenghaichun
-category: other
-tags: 生活
+category: computer
+tags: 计算机
 finished: true
 ---
 
