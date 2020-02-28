@@ -34,7 +34,7 @@ finished: true
 
 以下是仿制药通过一致性评价的标识：
 
-![Codes](/img/)
+![Codes](/img/consistent_mark.jpeg)
 
 ### 3.3 买国外品牌在中国生产的药
 ### 3.4 买大厂的药
