@@ -1,0 +1,366 @@
+---
+layout: post
+title: "rocketMQ研究"
+subtitle: ""
+date: 2020-02-28
+author: fenghaichun
+category: 中间件
+tags: 互联网技术
+finished: true
+---
+
+
+# rocketMQ产品介绍文档
+
+# 1. 产品介绍
+   rocketMQ是一个开源的分布式消息传递和流数据平台,具有低延迟、高吞吐量、高可用等特性。
+
+# 2. 适用场景
+
+- 流计算
+- 消息推送
+- 日志流式处理
+- binglog分发等场景
+- 异步解耦
+- 流量削峰
+
+# 3. 专业术语
+
+- consumer：消息消费者
+- Producer：消息生产者
+- Producer Group：一类生产者的集合，代表了生产一类消息且发送逻辑一致的 Producers
+- Consumer Group：一类消费者的集合，代表了消费一类消息且消费逻辑一致的 Consumers
+- Topic：主题，一个Topic可以看做一个消息的类型，存储在 Broker 上
+- Broker：服务器实例，用来接收并存储来自生产者的消息，消费者从这里消费消息。除此之外还存储消息相关的元数据，包括用户组、消费进度偏移量、队列信息等。在集群模式下可分为 master broker 和 slave broker，master broker 可读写，slave broker 只能写,master 和 slave 的关系通过相同的 BrokerName 不同的 BrokerId 来定义，BrokerId 为 0 的为 master，每个 broker 会与 NameServer 集群的每个实例建立连接
+- NameServer：名称服务器，和 kafka 中的 zk 作用类似：1.管理 Broker，接收 broker 的注册并且通过心跳机制来检查 broker 是否存活；2.管理路由，集群中的每个 NameServer 都保存有全部的路由信息以及供客户端查询的队列信息；与 zk 的区别是 NameServer 之间相互之间不通信
+- Queue: Topic 的下一级，一个 Topic 下可以设置多个 Queue，一个 Topic 下的 多个 Queue 可以分布在多个 Broker 上 
+
+# 4. 优缺点对比
+优点：
+
+- 高可用，通过主从模式实现
+- 灵活额扩展性，NameServer、Broker、Producer、Consumer 
+- 官方提供管理界面
+- 海量的消息堆积能力，并且在堆积了大量消息后依然可以保证写入低延迟
+- 支持顺序消息、事务消息
+- 支持在服务器端过滤消息和消费端过滤消息
+- 消息可持久化
+- 支持通过时间和偏移量来回溯消费消息
+- 消息可以通过 pull 和 push 两种模式来进行消费
+
+缺点：
+
+- 当 master 挂掉时 slave 不能自动切换为 master
+
+与kafka的对比：
+
+|  | 可靠性 | 写入性能 | 消息消费并发 | 单机队列数 | 消息投递实时性 | 失败重试 | 消息顺序 | 定时消息 | 消息查询 | 消息堆积 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| rocket | 1 | 0 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 0 |
+| kafka | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+
+说明：
+
+- 可靠性：rocket支持同步刷盘、同步备份，而kafka是异步刷盘、异步备份
+- 写入性能：kafka写入Kafka单机写入TPS约在百万条/秒，消息大小10个字节，rocket12万条/秒，消息大小10个字节
+- 消息消费并发：rocketMQ支持更多的队列，可以增加消费者并发消费，而kafka受限于patition的数量
+- 消息投递实时性：rocketMQ消费端采用长轮询，实时性更高
+- 消息顺序性：rocketMQ的顺序消息在broker宕机时会失败，kafka的顺序消息在broker宕机后会产生乱序
+- 定时消息：rocketMQ支持固定精度的定时消息，kafka不支持
+- 消息查询：rocketMQ支持对历史消息的查询，kafka不支持
+- 消息堆积能力：kafka更厉害
+
+# 5. 部署方案
+rocketMQ分为三个部分：
+
+- nameserver
+- broker
+- rocketmq-console（控制台可选）
+
+这三部分分别要做高可用部署：
+
+- nameserver集群
+- broker多master、多slave
+- rocketmq-console集群模式可选
+
+高可用物理部署如下图所示：<br />![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560409631883-c6405c38-1208-432a-a710-b71e686c5d2a.png#align=left&display=inline&height=349&name=image.png&originHeight=546&originWidth=1168&size=229885&status=done&width=746)
+
+
+
+
+# 6. 架构原理
+
+## 6.1 总体架构
+![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560412017570-ef56e14f-0c77-4df7-bf08-ce34d5a0be40.png#align=left&display=inline&height=359&name=image.png&originHeight=720&originWidth=1496&size=148293&status=done&width=746)<br />简述：
+
+- nameserver集群中的各个实例（节点）相互独立且互不通信，每个nameserver启动后监听指定端口，等待producer、broker、consumer连接，然后记录各方的信息。
+- broker分为master与slave两种，master类型的可以读写、slave只读，每个broker（包括slave）和nameserver集群中的每个实例（节点）保持长连接，并定时发送心跳及注册信息（包括自己的IP+端口、topic、）。
+- 生产者从NameServer集群中依据负载均衡算法选择一个进行连接，然后定时（默认30s）获取topic信息及topic所在broker，topic一般选择自动创建，生产者拿到broker信息后和具体的broker建立连接，然后发送消息
+- 消费者从NameServer集群中依据负载均衡算法选择一个进行连接，然后查询topic对应的broker，然后跟具体的broker建立连接并开始消费消息
+
+## 6.2 NameServer
+![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560414244394-af317716-1fb8-412d-b9e3-8448fc5f34b8.png#align=left&display=inline&height=396&name=image.png&originHeight=616&originWidth=1160&size=205459&status=done&width=746)<br />nameServer与每个broker（包括slave）保持长连接，并每隔30秒收集broker的心跳，如果超过30秒没有收到，则从路由信息中剔除这个broker。问题来了：消息生产者也是每隔30秒拉取路由信息，这样的话某个broker的路由信息在NameServer中被删除这个信息在最坏情况下要过30s才能被消息生产者得知，那么在这期间会不会有消息丢失呢？答案是不会，因为如果某个broker宕机了，那么首先发送消息会失败，rocketMQ在生产者客户端会进行多次重试直到从NameServer中得知该broker确实宕机了，然后会尝试切换到别的broker继续发送消息。
+
+## 6.3 broker
+broker主要负责Topic消息存储、管理和分发等功能。<br />RocketMQ主要存储的文件包括三个：Comitlog文件、ConsumeQueue文件、IndexFile文件。
+
+- comitlog：RocketMQ将所有主题的消息存储在同一个Comitlog文件中，一个文件满1G，再写新文件，确保消息发送时顺序写文件，尽最大的能力确保消息发送的高性能与高吞吐量。
+- ConsumeQueue文件：为了提高消息消费的效率，RocketMQ引入了ConsumeQueue消息队列文件，每个消息主题包含多个消息消费队列，每一个消息队列有一个消息文件。
+- IndexFile索引文件，其主要设计理念就是为了加速消息的检索性能，根据消息的属性快速从Commitlog文件中检索消息
+
+消息存储的原理如下图所示：<br />![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560417657913-fa79962b-a373-407c-ae56-ab6494d4b340.png#align=left&display=inline&height=419&name=image.png&originHeight=652&originWidth=1160&size=146760&status=done&width=746)
+
+
+### 6.3.1 消息存储总目录结构
+
+```
+drwxr-xr-x   5 fhc  staff   160  6 12 20:27 ..
+-rw-r--r--   1 fhc  staff     0  6 12 20:27 abort
+drwxr-xr-x   9 fhc  staff   288  6 12 20:28 .
+drwxr-xr-x   3 fhc  staff    96  6 12 20:29 commitlog
+drwxr-xr-x   9 fhc  staff   288  6 13 15:41 consumequeue
+drwxr-xr-x   3 fhc  staff    96  6 13 15:43 index
+-rw-r--r--   1 fhc  staff     4  6 13 15:43 lock
+-rw-r--r--   1 fhc  staff  4096  6 13 17:23 checkpoint
+drwxr-xr-x  11 fhc  staff   352  6 13 17:24 config
+```
+
+
+### 6.3.2 commitlog文件夹目录结构
+
+```
+00000000000000000000
+00000000000000134523
+```
+其中文件名为文件中第一条消息的偏移量。
+
+
+### 6.3.3 consumequeue文件夹的结构
+```
+brucedeMacBook-Pro:store fhc$ cd consumequeue/
+brucedeMacBook-Pro:consumequeue fhc$ ll
+total 0
+drwxr-xr-x  9 fhc  staff  288  6 12 20:28 ..
+drwxr-xr-x  6 fhc  staff  192  6 12 20:28 TopicTest
+drwxr-xr-x  6 fhc  staff  192  6 13 10:00 TopicTestB
+drwxr-xr-x  6 fhc  staff  192  6 13 10:06 TopicTestC
+drwxr-xr-x  6 fhc  staff  192  6 13 10:09 TopicTestD
+drwxr-xr-x  6 fhc  staff  192  6 13 10:12 TopicTestE
+drwxr-xr-x  6 fhc  staff  192  6 13 10:20 TopicTestF
+drwxr-xr-x  9 fhc  staff  288  6 13 15:41 .
+drwxr-xr-x  6 fhc  staff  192  6 13 15:41 TopicTestG
+brucedeMacBook-Pro:consumequeue fhc$ cd TopicTestG/
+brucedeMacBook-Pro:TopicTestG fhc$ ll
+total 0
+drwxr-xr-x  9 fhc  staff  288  6 13 15:41 ..
+drwxr-xr-x  3 fhc  staff   96  6 13 15:41 0
+drwxr-xr-x  3 fhc  staff   96  6 13 15:41 1
+drwxr-xr-x  3 fhc  staff   96  6 13 15:41 2
+drwxr-xr-x  6 fhc  staff  192  6 13 15:41 .
+drwxr-xr-x  3 fhc  staff   96  6 13 15:41 3
+brucedeMacBook-Pro:TopicTestG fhc$ cd 0/
+brucedeMacBook-Pro:0 fhc$ ll
+total 11720
+drwxr-xr-x  3 fhc  staff       96  6 13 15:41 .
+drwxr-xr-x  6 fhc  staff      192  6 13 15:41 ..
+-rw-r--r--  1 fhc  staff  6000000  6 13 15:44 00000000000000000000
+```
+
+为了加速ConsumeQueue消息条目的检索速度与节省磁盘空间，每一个Consumequeue条目不会存储消息的全量信息,Consumequeue条目 的存储结构如下图所示：<br />![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560418458279-d21b16fb-e2b3-4d0b-8c8d-285b724d10b6.png#align=left&display=inline&height=167&name=image.png&originHeight=254&originWidth=1134&size=79556&status=done&width=746)
+
+### 6.3.4 负载均衡与动态收缩
+
+**负载均衡**：Broker上存Topic信息，Topic由多个队列组成，队列会平均分散在多个Broker上，而Producer的发送机制保证消息尽量平均分布到所有队列中，最终效果就是所有消息都平均落在每个Broker上。
+
+**动态伸缩能力（非顺序消息**）：Broker的伸缩性体现在两个维度：Topic, Broker。
+
+- Topic维度：假如一个Topic的消息量特别大，但集群水位压力还是很低，就可以扩大该Topic的队列数，Topic的队列数跟发送、消费速度成正比。
+- Broker维度：如果集群水位很高了，需要扩容，直接加机器部署Broker就可以。Broker起来后向Namesrv注册，Producer、Consumer通过Namesrv发现新Broker，立即跟该Broker直连，收发消息。
+
+### 6.3.5 高可用
+
+- 集群部署时一般都为主备，备机实时从主机同步消息，如果其中一个主机宕机，备机提供消费服务，但不提供写服务。
+- 所有发往broker的消息，有同步刷盘和异步刷盘机制；同步刷盘时，消息写入物理文件才会返回成功，异步刷盘时，只有机器宕机，才会产生消息丢失。
+
+### 6.3.6 过期消息删除
+RocketMQ清除过期文件的方法是：如果非当前写文件在一定时间间隔内没有再次被更新，则认为是过期文件，可以被删除，RocketMQ不会关注这个文件上的消息是否全部被消费。默认每个文件的过期时间为72小时，通过在Broker配置文件中设置fileReservedTime来改变过期时间，单位为小时。
+
+过期消息的删除在达到下面任意一个条件时触发：
+
+1. 消息文件过期（默认72小时），且到达清理时点（默认是凌晨4点），删除过期文件。
+1. 消息文件过期（默认72小时），且磁盘空间达到了水位线（默认75%），删除过期文件。
+1. 磁盘已经达到必须释放的上限（85%水位线）的时候，则开始批量清理文件（无论是否过期），直到空间充足。
+
+注：若磁盘空间达到危险水位线（默认90%），出于保护自身的目的，broker会拒绝写入服务。
+
+## 6.4 消息生产者
+RocketMQ支持3种消息发送方式：同步（sync）、异步（async）、单向（oneway）。
+
+- 同步：发送者向MQ执行发送消息API时，同步等待，直到消息服务器返回发送结果。
+- 异步：发送者向MQ执行发送消息API时，指定消息发送成功后的回掉函数，然后调用消息发送API后，立即返回，消息发送者线程不阻塞，直到运行结束，消息发送成功或失败的回调任务在一个新的线程中执行。
+- 单向：消息发送者向MQ执行发送消息API时，直接返回，不等待消息服务器的结果，也不注册回调函数，简单地说，就是只管发，不在乎消息是否成功存储在消息服务器上。
+
+
+### 6.4.1 消息发送流程
+
+1. 验证消息是否合法：具体包括主题名称、消息体不能为空、消息长度不能等于0且默认不能超过允许发送消息的最大长度4M（maxMessageSize=1024*1024*4）。
+1. 查找路由：如果生产者中缓存了topic的路由信息，如果该路由信息中包含了消息队列，则直接返回该路由信息，如果没有缓存或没有包含消息队列，则向NameServer查询该topic的路由信息。如果最终未找到路由信息，则抛出异常：无法找到主题相关路由信息异常。
+1. 选择消息队列：分两种情况：
+  1. 未开启故障延迟机制（默认）：客户端会记录上次发送失败的broker，然后采用某种负载均衡算法（大致是生成一个随机数然后与当前Topic的队列个数取模）查找队列所在broker不等于上次失败的broker的队列
+  1. 开启故障延迟机制：在Broker宕机期间，如果一次消息发送失败后，可以将该Broker暂时排除在消息队列的选择范围中，然后轮询选择队列，接着验证该队列对应的broker是否可用，如果可用但是被排除在外，则从排除列表中恢复，如果不可用则增加延迟时间。最终效果是尽可能规避往失败的broker发送消息。
+4. 发送消息：
+  1. 同步发送
+  1. 异步发送
+  1. 单向发送
+
+## 6.5 消息消费者
+消息消费以组的模式开展，一个消费组内可以包含多个消费者，每一个消费组可订阅多个主题，消费组之间有集群模式与广播模式两种消费模式。
+
+- 集群模式：主题下的同一条消息只允许被其中一个消费者消费。
+- 广播模式，主题下的同一条消息将被集群内的所有消费者消费一次。
+
+消息服务器与消费者之间的消息传送也有两种方式：推模式、拉模式。所谓的拉模式，是消费端主动发起拉消息请求，而推模式是消息到达消息服务器后，推送给消息消费者。
+
+
+### 6.5.1 消息的顺序性
+RocketMQ支持局部顺序消息消费，也就是保证同一个消息队列上的消息顺序消费。不支持消息全局顺序消费，如果要实现某一主题的全局顺序消息消费，可以将该主题的队列数设置为1，如果部署上存在多个broker，还要指定具体的broker，然后消费端采用顺序消费模式，但会牺牲高可用性。
+
+还有个方法是通过自定义队列选择器，将需要顺序性的消息发送到同一个broker上的同一个队列。
+
+### 6.5.2 消息的幂等性
+在增加消费者后，再均衡的时候可能会发生重复消费。RocketMQ会为每条消息生成唯一ID，以辅助业务方进行消息重复读的去重、验证。
+
+### 6.5.3 消费者对消息队列的负载均衡
+消费者对消息队列的负载均衡在客户端进行，负载均衡大致分为两个阶段：
+
+1. 客户端从broker、nameserver收集两种信息：当前消费组下的所有消费者、当前消费组要消费的所有消息队列
+1. 根据策略（有多种）计算当前客户端应该负责的消费队列，每个客户端的算法是一样的，因此不会发生队列被漏掉的情况。
+
+
+## 6.6 事务消息
+
+### 6.6.1 事务消息实现原理
+RocketMQ事务消息的实现原理基于两阶段提交和定时事务状态回查来决定消息最终是提交还是回滚。<br />1）应用程序在事务内完成相关业务数据落库后，需要同步调用RocketMQ消息发送接口，发送状态为prepare的消息。消息发送成功后，RocketMQ服务器会回调RocketMQ消息发送者的事件监听程序，记录消息的本地事务状态，该相关标记与本地业务操作同属一个事务，确保消息发送与本地事务的原子性。<br />2）RocketMQ在收到类型为prepare的消息时，会首先备份消息的原主题与原消息消费队列，然后将消息存储在主题为RMQ_SYS_TRANS_HALF_TOPIC的消息消费队列中。<br />3）RocketMQ消息服务器开启一个定时任务，消费RMQ_SYS_TRANS_HALF_TOPIC的消息，向消息发送端（应用程序）发起消息事务状态回查，应用程序根据保存的事务状态回馈消息服务器事务的状态（提交、回滚、未知），如果是提交或回滚，则消息服务器提交或回滚消息，如果是未知，待下一次回查，RocketMQ允许设置一条消息的回查间隔与回查次数，如果在超过回查次数后依然无法获知消息的事务状态，则默认回滚消息。
+
+交互原理图如下所示：<br />![image.png](https://cdn.nlark.com/yuque/0/2019/png/326949/1560741689041-63c4a6e9-360e-453a-a1ac-6e29d8641678.png#align=left&display=inline&height=378&name=image.png&originHeight=756&originWidth=1568&size=286385&status=done&width=784)
+
+# 7. 使用方法
+
+## 7.1 消息生产者
+
+1. 引入maven依赖：
+
+```
+<dependency>
+			<groupId>org.apache.rocketmq</groupId>
+			<artifactId>rocketmq-client</artifactId>
+			<version>${rocketmq.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.rocketmq</groupId>
+			<artifactId>rocketmq-common</artifactId>
+			<version>${rocketmq.version}</version>
+		</dependency>
+```
+
+2. 指定nameserver地址，并启动生产者，代码示例：
+
+```
+    public static void main(String[] args) throws Exception {
+        //Instantiate with a producer group name.
+        DefaultMQProducer producer = new DefaultMQProducer("group_test");
+        // Specify name server addresses.
+        producer.setNamesrvAddr("192.168.16.96:9876:192.168.16.96:9877");
+        //Launch the instance.
+        producer.setDefaultTopicQueueNums(3);
+        producer.start();
+
+        int i = 0;
+
+        while (true)
+        {
+            //Create a message instance, specifying topic, tag and message body.
+            Message msg = new Message("TopicTestM" /* Topic */,
+                    "TagA" /* Tag */,
+                    ("Hello RocketMQ " + i).getBytes(RemotingHelper.DEFAULT_CHARSET) /* Message body */
+            );
+            //Call send message to deliver message to one of brokers.
+            SendResult sendResult = producer.send(msg);
+            System.out.printf("%s%n", sendResult);
+            Thread.sleep(1000);
+        }
+        //Shut down once the producer instance is not longer in use.
+        //producer.shutdown();
+    }
+```
+
+
+## 7.2 消息消费者
+
+1. 引入maven依赖，同生产者
+1. 指定nameserver并启动消费者：
+
+```
+ public static void main(String[] args) throws InterruptedException, MQClientException {
+
+        // Instantiate with specified consumer group name.
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("group_test");
+
+        // Specify name server addresses.
+        consumer.setNamesrvAddr("192.168.16.96:9876:192.168.16.96:9877");
+
+        // Subscribe one more more topics to consume.
+        consumer.subscribe("TopicTestM", "*");
+        // Register callback to execute on arrival of messages fetched from brokers.
+        consumer.registerMessageListener(new MessageListenerConcurrently() {
+
+            @Override
+            public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs,
+                                                            ConsumeConcurrentlyContext context) {
+                System.out.printf("%s Receive New Messages: %s %n", Thread.currentThread().getName(), msgs);
+                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+            }
+        });
+
+        //Launch the consumer instance.
+        consumer.start();
+
+        System.out.printf("Consumer Started.%n");
+    }
+```
+
+
+# 8 FAQ
+
+## 8.1 rocketMQ消息文件删除策略是什么？
+如果非当前写文件在一定时间间隔（默认72小时）内没有再次被更新，则认为是过期文件。<br />过期消息的删除在达到下面任意一个条件时触发：
+
+1. 消息文件过期（默认72小时），且到达清理时点（默认是凌晨4点），删除过期文件。
+1. 消息文件过期（默认72小时），且磁盘空间达到了水位线（默认75%），删除过期文件。
+1. 磁盘已经达到必须释放的上限（85%水位线）的时候，则开始批量清理文件（无论是否过期），直到空间充足。
+1. 若磁盘空间达到危险水位线（默认90%），出于保护自身的目的，broker会拒绝写入服务。
+
+
+## 8.2 如何保证消息的顺序性？
+rocketMQ不保证消息的全局顺序，只能保证局部顺序。所谓的局部指的是broker+queue，局部顺序性的实现有两部分：
+
+1. 消息生产者将需要保证顺序的消息发送到同一个broker上的同一个queue
+1. 消息消费者使用注册MessageListenerOrderly消费消息，这种情况下消费者消费队列消息前会尝试锁定队列，保证队列只被一个消费者消费
+
+
+## 8.3 事务过程原理？
+RocketMQ事务消息的实现原理基于两阶段提交和定时事务状态回查来决定消息最终是提交还是回滚。<br />事务参与方为：消息生产者、rocketMQ（broker）。
+
+- 第一阶段：生产者将事务消息发送到broker，broker将消息存储到某个系统的Topic，然后做两件事情：
+  - 通知消息生产者执行本地事务
+  - 启动一个定时器定时检查消息生产者本地事务执行情况
+- 第二阶段：消息生产者记录本地事务执行结果，同时broker定时检查本地事务执行结果，如果本地事务执行成功则broker将消息提交到响应队列，如果本地事务执行失败或者超过一定次数无法得知本地事务执行结果，则删除消息。
+
+## 8.4 rocketMQ相比kafka的主要优势？
+
+- rocketMQ可靠性更高（可同步刷盘、同步备份，kafka定时刷盘）
+- rocketMQ写入较慢但是消费较快（同一个broker，rocketMQ持久化文件只有一个，而kafka会有多个导致磁盘IO过高）
+- 消息消费并发：rocketMQ支持更多的队列，可以增加消费者并发消费，而kafka受限于patition的数量
+- 消息投递实时性：rocketMQ消费端采用长轮询，实时性更高
+- 定时消息：rocketMQ支持固定精度的定时消息，kafka不支持
+- 消息查询：rocketMQ支持对历史消息的查询，kafka不支持
