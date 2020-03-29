@@ -1,0 +1,697 @@
+---
+layout: post
+title: "quartz研究"
+subtitle: ""
+date: 2019-03-28
+author: fenghaichun
+category: 中间件
+tags: 互联网技术
+finished: true
+---
+
+<a name="BbsCA"></a>
+## 1. 产品介绍
+Quartz 是一个完全由 Java 编写的开源作业调度框架，为在 Java 应用程序中进行作业调度提供了简单却强大的机制。<br />Quartz 可以与[ J2EE](https://www.w3cschool.cn/java_interview_question/java_interview_question-wvr326ra.html) 与 J2SE 应用程序相结合也可以单独使用。<br />Quartz 允许程序开发人员根据时间的间隔来调度作业。<br />Quartz 实现了作业和触发器的多对多的关系，还能把多个作业与不同的触发器关联。<br />官网地址：[http://www.quartz-scheduler.org/](http://www.quartz-scheduler.org/)<br />github源码地址：[https://github.com/quartz-scheduler/quartz](https://github.com/quartz-scheduler/quartz)<br />使用的开源协议为：[Apache 2.0 license](http://www.apache.org/licenses/LICENSE-2.0)
+
+<a name="55eZ5"></a>
+## 2. 适用场景
+
+- 定时更新数据：比如定时更新缓存、定时清理垃圾数据、定时检测服务器状态等
+- 定时计算：比如定时计算用户积分等
+
+<a name="2s9Zb"></a>
+## 3. 专业术语
+<a name="8jk3Y"></a>
+### 3.1 Job
+表示工作，负责执行具体的业务，在Quartz中抽象为Job接口，其中只有一个方法：
+> void execute(JobExecutionContext context)
+
+用户可以实现该接口并在接口实现中写业务逻辑。
+<a name="lceTJ"></a>
+### 3.2 JobDetail
+表示一个可调度的程序，相比Job，JobDetail不仅包含Job，还包含部分调度策略，比如失败恢复。
+<a name="qd5rd"></a>
+### 3.3 Trigger
+代表一个调度参数的配置，确定什么时候执行作业，执行作业的频率。
+<a name="s9XJz"></a>
+### 3.4 Schedule
+代表一个调度器，一个调度器可以调度多个JobDetail和Trigger。<br />调度器的接口是这样的：
+
+```java
+Date scheduleJob(JobDetail jobDetail, Trigger trigger)
+        throws SchedulerException;
+```
+
+从代码可以看出，要调度一个作业，首先要实例化并启动一个调度器，然后构造调度参数Trigger与作业信息JobDetail。
+
+<a name="0zUhb"></a>
+## 4. 优缺点对比
+优点
+
+- 使用简单
+- 灵活性较高，可以与web服务器容器运行在一个jvm里，也可以单独运行
+
+缺点
+
+- 集群模式依赖一个数据库，如果要求做严格高可用，这个数据库也要做高可用
+- 由于调度信息保存在数据库里，存在性能损失
+- 现成没有监控接口
+- 不支持作业分片
+<a name="Wv2um"></a>
+## 5. 架构原理
+<a name="R53LZ"></a>
+### 5.1 quartz核心原理
+<a name="XBlFH"></a>
+#### 调度主体方法
+quartz为生产者消费者模式，生产者通过schedule接口生产产品，线程池中的线程作为消费者消费产品。<br />提交调度作业的主要代码：
+```
+public Date scheduleJob(JobDetail jobDetail,
+            Trigger trigger) throws SchedulerException {
+        validateState();
+        if (jobDetail == null) {
+            throw new SchedulerException("JobDetail cannot be null");
+        }
+        
+        if (trigger == null) {
+            throw new SchedulerException("Trigger cannot be null");
+        }
+        
+        if (jobDetail.getKey() == null) {
+            throw new SchedulerException("Job's key cannot be null");
+        }
+        if (jobDetail.getJobClass() == null) {
+            throw new SchedulerException("Job's class cannot be null");
+        }
+        
+        OperableTrigger trig = (OperableTrigger)trigger;
+        if (trigger.getJobKey() == null) {
+            trig.setJobKey(jobDetail.getKey());
+        } else if (!trigger.getJobKey().equals(jobDetail.getKey())) {
+            throw new SchedulerException(
+                "Trigger does not reference given job!");
+        }
+        trig.validate();
+        Calendar cal = null;
+        if (trigger.getCalendarName() != null) {
+            cal = resources.getJobStore().retrieveCalendar(trigger.getCalendarName());
+        }
+        Date ft = trig.computeFirstFireTime(cal);
+        if (ft == null) {
+            throw new SchedulerException(
+                    "Based on configured schedule, the given trigger '" + trigger.getKey() + "' will never fire.");
+        }
+        resources.getJobStore().storeJobAndTrigger(jobDetail, trig);
+        notifySchedulerListenersJobAdded(jobDetail);
+        notifySchedulerThread(trigger.getNextFireTime().getTime());
+        notifySchedulerListenersSchduled(trigger);
+        return ft;
+    }
+```
+代码大体含义：
+
+- 检查调度器是否被关闭，如果关闭则抛出异常
+- 检查必要的参数
+- 检查job与trigger的关联是否正确（从此处代码可以看出一个trigger可以关联多个job）
+- 计算作业首次被执行的时间，作为返回值
+- 保存job、trigger（保存策略有基于内存、数据库的方式，根据配置文件决定）
+- 通知、调度器监听器、调度器主线程
+- 最后返回作业首次执行时间
+
+ 
+<a name="eUHyT"></a>
+#### 调度主线程
+跟踪notifySchedulerThread这个方法，最后到了下面的代码：
+```
+public void signalSchedulingChange(long candidateNewNextFireTime) {
+        synchronized(sigLock) {
+            signaled = true;
+            signaledNextFireTime = candidateNewNextFireTime;
+            sigLock.notifyAll();
+        }
+    }
+```
+该方法唤醒在sigLock上休眠的线程，可以猜测这个线程应该就是主线程，查看对sigLock的引用，找到这个超级长的方法：
+```
+/**
+     * <p>
+     * The main processing loop of the <code>QuartzSchedulerThread</code>.
+     * </p>
+     */
+    @Override
+    public void run() {
+        boolean lastAcquireFailed = false;
+        while (!halted.get()) {
+            try {
+                // check if we're supposed to pause...
+                synchronized (sigLock) {
+                    while (paused && !halted.get()) {
+                        try {
+                            // wait until togglePause(false) is called...
+                            sigLock.wait(1000L);
+                        } catch (InterruptedException ignore) {
+                        }
+                    }
+                    if (halted.get()) {
+                        break;
+                    }
+                }
+                ...
+                ...
+```
+这个方法体内的逻辑就是主要调度逻辑，这个类就是：QuartzSchedulerThread.java<br />当调度器刚启动时paused=false，这时候线程在sigLock上wait,直到被提交作业的线程notify。<br /> 
+<a name="3kxWu"></a>
+#### 调度主线程主要逻辑分析
+ 
+
+- 从数据库或者内存（根据配置，内存的话在RAMJobStore这个类里）查找触发时间不晚于“当前时间+idleWaitTime+BatchTimeWindow”的N个trigger，N=Math.min(availThreadCount, qsRsrcs.getMaxBatchSize())。
+```
+try {
+                        triggers = qsRsrcs.getJobStore().acquireNextTriggers(
+                                now + idleWaitTime, Math.min(availThreadCount, qsRsrcs.getMaxBatchSize()), qsRsrcs.getBatchTimeWindow());
+                        lastAcquireFailed = false;
+                        if (log.isDebugEnabled()) 
+                            log.debug("batch acquisition of " + (triggers == null ? 0 : triggers.size()) + " triggers");
+                    } catch (JobPersistenceException jpe) {
+                        if(!lastAcquireFailed) {
+                            qs.notifySchedulerListenersError(
+                                "An error occurred while scanning for the next triggers to fire.",
+                                jpe);
+                        }
+                        lastAcquireFailed = true;
+                        continue;
+                    }
+```
+
+- 等待一段时间（timeUntilTrigger）等待触发时间到来
+```
+while(timeUntilTrigger > 2) {
+                            synchronized (sigLock) {
+                                if (halted.get()) {
+                                    break;
+                                }
+                                if (!isCandidateNewTimeEarlierWithinReason(triggerTime, false)) {
+                                    try {
+                                        // we could have blocked a long while
+                                        // on 'synchronize', so we must recompute
+                                        now = System.currentTimeMillis();
+                                        timeUntilTrigger = triggerTime - now;
+                                        if(timeUntilTrigger >= 1)
+                                            sigLock.wait(timeUntilTrigger);
+                                    } catch (InterruptedException ignore) {
+                                    }
+                                }
+                            }
+                            if(releaseIfScheduleChangedSignificantly(triggers, triggerTime)) {
+                                break;
+                            }
+                            now = System.currentTimeMillis();
+                            timeUntilTrigger = triggerTime - now;
+                        }
+```
+
+- 根据这些triggers获取他们关联的job
+```
+try {
+                                List<TriggerFiredResult> res = qsRsrcs.getJobStore().triggersFired(triggers);
+                                if(res != null)
+                                    bndles = res;
+                            } catch (SchedulerException se) {
+                                qs.notifySchedulerListenersError(
+                                        "An error occurred while firing triggers '"
+                                                + triggers + "'", se);
+                                //QTZ-179 : a problem occurred interacting with the triggers from the db
+                                //we release them and loop again
+                                for (int i = 0; i < triggers.size(); i++) {
+                                    qsRsrcs.getJobStore().releaseAcquiredTrigger(triggers.get(i));
+                                }
+                                continue;
+                            }
+```
+
+- 遍历上面的job列表，每个job包装成JobRunShell，并将JobRunShell提交到配置好的线程池里
+```
+for (int i = 0; i < bndles.size(); i++) {
+                            TriggerFiredResult result =  bndles.get(i);
+                            TriggerFiredBundle bndle =  result.getTriggerFiredBundle();
+                            Exception exception = result.getException();
+                            if (exception instanceof RuntimeException) {
+                                getLog().error("RuntimeException while firing trigger " + triggers.get(i), exception);
+                                qsRsrcs.getJobStore().releaseAcquiredTrigger(triggers.get(i));
+                                continue;
+                            }
+                            // it's possible to get 'null' if the triggers was paused,
+                            // blocked, or other similar occurrences that prevent it being
+                            // fired at this time...  or if the scheduler was shutdown (halted)
+                            if (bndle == null) {
+                                qsRsrcs.getJobStore().releaseAcquiredTrigger(triggers.get(i));
+                                continue;
+                            }
+                            JobRunShell shell = null;
+                            try {
+                                shell = qsRsrcs.getJobRunShellFactory().createJobRunShell(bndle);
+                                shell.initialize(qs);
+                            } catch (SchedulerException se) {
+                                qsRsrcs.getJobStore().triggeredJobComplete(triggers.get(i), bndle.getJobDetail(), CompletedExecutionInstruction.SET_ALL_JOB_TRIGGERS_ERROR);
+                                continue;
+                            }
+                            if (qsRsrcs.getThreadPool().runInThread(shell) == false) {
+                                // this case should never happen, as it is indicative of the
+                                // scheduler being shutdown or a bug in the thread pool or
+                                // a thread pool being used concurrently - which the docs
+                                // say not to do...
+                                getLog().error("ThreadPool.runInThread() return false!");
+                                qsRsrcs.getJobStore().triggeredJobComplete(triggers.get(i), bndle.getJobDetail(), CompletedExecutionInstruction.SET_ALL_JOB_TRIGGERS_ERROR);
+                            }
+                        }
+```
+
+- 继续等待用户提交作业
+```
+long now = System.currentTimeMillis();
+                long waitTime = now + getRandomizedIdleWaitTime();
+                long timeUntilContinue = waitTime - now;
+                synchronized(sigLock) {
+                    try {
+                      if(!halted.get()) {
+                        // QTZ-336 A job might have been completed in the mean time and we might have
+                        // missed the scheduled changed signal by not waiting for the notify() yet
+                        // Check that before waiting for too long in case this very job needs to be
+                        // scheduled very soon
+                        if (!isScheduleChanged()) {
+                          sigLock.wait(timeUntilContinue);
+                        }
+                      }
+                    } catch (InterruptedException ignore) {
+                    }
+                }
+```
+ 
+
+<a name="E6ezi"></a>
+### 5.2 集群模式及其原理
+
+<a name="rpAKN"></a>
+#### 集群模式的开启
+
+- 配置org.quartz.jobStore.isClustered的值为True
+- JobStore使用JobStoreTX或者 JobStoreCMT，前者独立管理事务，后者需要别的web服务器管理事务
+- 使用同一份quartz.properties文件，但是其中org.quartz.scheduler.instanceId必须不能重复（可以设置值为Auto），其中的线程池大小等配置可以不同
+<a name="vG4zx"></a>
+#### 注意事项
+
+- 集群机器之间的时钟要同步
+- Never fire-up a non-clustered instance against the same set of tables that any other instance is running against. You may get serious data corruption, and will definitely experience erratic behavior.（没懂）
+<a name="1loMm"></a>
+#### 集群模式的特性
+
+- 负载均衡
+- 故障转移(JobDetail的requestsRecovery属性为true的情况下)
+
+例如：
+```
+JobBuilder.newJob()
+				   .ofType(QueryJob.class)
+				   .withIdentity(queryEntity.getJobName(), group)
+				   .requestRecovery()
+				   .storeDurably()
+				   .withDescription(queryEntity.getDescription())
+				   .build();
+```
+<a name="BtSb1"></a>
+### 5.3 如何实现故障转移
+<a name="cqBeu"></a>
+#### Quartz Scheduler在集群中的启动流程
+Quartz Scheduler自身是察觉不到被集群的，只有配置给Scheduler的JDBC JobStore才知道。当Quartz Scheduler启动时，它调用JobStore的schedulerStarted()方法，它告诉JobStore Scheduler已经启动了。schedulerStarted() 方法是在JobStoreSupport类中实现的。JobStoreSupport类会根据quartz.properties文件中的设置来确定Scheduler实例是否参与到集群中。假如配置了集群，一个新的ClusterManager类的实例就被创建、初始化并启动。ClusterManager是在JobStoreSupport类中的一个内嵌类，继承了java.lang.Thread，它会定期运行，并对Scheduler实例执行检入的功能。Scheduler也要查看是否有任何一个别的集群节点失败了。检入操作执行周期在quartz.properties中配置。
+<a name="LZAzw"></a>
+#### 侦测失败的Scheduler节点
+当一个Scheduler实例执行检入时，它会查看是否有其他的Scheduler实例在到达他们所预期的时间还未检入。这是通过检查SCHEDULER_STATE表中Scheduler记录在LAST_CHEDK_TIME列的值是否早于org.quartz.jobStore.clusterCheckinInterval来确定的。如果一个或多个节点到了预定时间还没有检入，那么运行中的Scheduler就假定它(们) 失败了。
+<a name="PcvDd"></a>
+#### 从故障实例中恢复Job
+当一个Sheduler实例在执行某个Job时失败了，有可能由另一正常工作的Scheduler实例接过这个Job重新运行。要实现这种行为，配置给JobDetail对象的Job可恢复属性必须设置为true（job.setRequestsRecovery(true)）。如果可恢复属性被设置为false(默认为false)，当某个Scheduler在运行该job失败时，它将不会重新运行；而是由另一个Scheduler实例在下一次触发时间触发。Scheduler实例出现故障后多快能被侦测到取决于每个Scheduler的检入间隔（org.quartz.jobStore.clusterCheckinInterval）。
+<a name="cHew0"></a>
+### 5.4 如何实现负载均衡
+> Currently, Quartz provides a minimal load-balancing capability using a random algorithm. Each Scheduler instance in the cluster attempts to fire scheduled triggers as fast as the Scheduler permits. The Scheduler instances compete (using database locks) for the right to execute a job by firing its trigger. When a trigger for a job has been fired, no other Scheduler will attempt to fire that particular trigger until the next scheduled firing time. This mechanism works better than you might infer from its simplicity. This is because the Scheduler that is "most busy" will be the one least likely to find the next job to fire. Hence, it's possible to achieve something near to a true balancing of the load.
+
+[https://flylib.com/books/en/2.65.1/what_does_clustering_mean_to_quartz_.html](https://flylib.com/books/en/2.65.1/what_does_clustering_mean_to_quartz_.html)
+> The primary class in question is org.quartz.impl.jdbcjobstore.JobStoreSupport - which has two extensions JobStoreTX and JobStoreCMT - but the code you're interested is largely in the JobStoreSupport file (which contains a few non-public classes).
+> For JDBC JobStore Clustering:
+> Load distribution will be random, with some favoring of the last node to run a job to run the next job.
+> If there are more jobs ready to run than there are worker threads in the nodes, then the balance will be even between nodes. E.g. if there are 5 nodes and there are 20 worker threads configured for each node, and there are 2000 jobs scheduled to run now, then all 5 nodes will run 20 jobs, and then 20 more as the first one completes, etc.
+> If there are fewer jobs ready to run than there are worker threads in the nodes then you will more likely see some subset of the nodes run the majority of the jobs. E.g if there are 5 nodes with 20 threads each but only 60 jobs scheduled to run now, then you may likely see something like 2 nodes running 20 jobs each, and 1 node running 10 jobs, another node running 10 jobs, and the last node running zero. It just depends on how the nodes "race" at accessing and firing the triggers.
+> If you have very few jobs, it may appear as if there is no load balancing, as the node that fires a given job is the one favored to fire the next job. For example if you have 20 threads per node, and only 5 jobs, you may see all 5 jobs run on one node - as it may find and fire all 5 before any other node discovers the need to fire the jobs.
+> For TerracottaJobStore w/Quartz Where:
+> Basic functionality is similar to what is described above for JDBC JobStore, but the Quartz Where functionality introduces cluster communication and algorithms that bring the balancing closer to a round-robin approach. [http://forums.terracotta.org/forums/posts/list/6504.page](http://forums.terracotta.org/forums/posts/list/6504.page)
+
+简单来说，quartz的负载均衡是这样的：每个调度器实例在触发时间都会去努力尝试获取锁并且拉取任务然后运行，已经拉取的作业将不会被别的调度器实例重复拉取，知道下次触发时间到来，这时候“最不忙的”那个调度器将争取到锁并拉取作业。如果作业数量较少负载均衡的效果将不是很明显，但如果作业数量较大将能体现出负载均衡的效果。
+<a name="JmjTv"></a>
+### 5.5 其他
+当前，如果不直接进到数据库查询的话，还没有一个简单的方式来得到集群中所有正在执行的Job列表。Quartz官网建议可以通过写一些访问数据库JDBC代码来从相应的表中获取全部的Job信息。
+
+ 
+<a name="aMMdR"></a>
+### 5.6 集群模式代码分析
+<a name="xe57c"></a>
+#### 集群模式实现的代码位置
+在quartz源码中搜索关键字isClustered，在JobstoreSupport类中定位到schedulerStarted方法：
+```
+public void schedulerStarted() throws SchedulerException {
+        if (isClustered()) {
+            clusterManagementThread = new ClusterManager();
+            if(initializersLoader != null)
+                clusterManagementThread.setContextClassLoader(initializersLoader);
+            clusterManagementThread.initialize();
+        } else {
+            try {
+                recoverJobs();
+            } catch (SchedulerException se) {
+                throw new SchedulerConfigException(
+                        "Failure occured during job recovery.", se);
+            }
+        }
+        misfireHandler = new MisfireHandler();
+        if(initializersLoader != null)
+            misfireHandler.setContextClassLoader(initializersLoader);
+        misfireHandler.initialize();
+        schedulerRunning = true;
+        
+        getLog().debug("JobStore background threads started (as scheduler was started).");
+```
+该方法在调度器启动后被调用。
+<a name="QVGGZ"></a>
+#### 集群checkin线程
+ClusterManager是一个线程，在调用initializes后会先调用一次checkin，然后将自己提交到线程池运行。在线程池里，该线程会每隔一段时间就checkin一次。<br />所谓的checkin，就是每隔一段时间调度器示例将自己的id、上次checkin时间、checkin时间间隔插入或者更新到数据库的SCHEDULER_STATE表里。如果有调度器实例在没有按照规定时间checkin，那么可以视为该实例挂了。<br />如果存在挂了的调度器，那么当前调度器实例会尝试进行故障转移，以恢复那个调度器中执行的作业。<br />checkin代码：
+```
+protected boolean doCheckin() throws JobPersistenceException {
+        boolean transOwner = false;
+        boolean transStateOwner = false;
+        boolean recovered = false;
+        Connection conn = getNonManagedTXConnection();
+        try {
+            // Other than the first time, always checkin first to make sure there is 
+            // work to be done before we acquire the lock (since that is expensive, 
+            // and is almost never necessary).  This must be done in a separate
+            // transaction to prevent a deadlock under recovery conditions.
+            List<SchedulerStateRecord> failedRecords = null;
+            if (!firstCheckIn) {
+                failedRecords = clusterCheckIn(conn);
+                commitConnection(conn);
+            }
+            
+            if (firstCheckIn || (failedRecords.size() > 0)) {
+                getLockHandler().obtainLock(conn, LOCK_STATE_ACCESS);
+                transStateOwner = true;
+    
+                // Now that we own the lock, make sure we still have work to do. 
+                // The first time through, we also need to make sure we update/create our state record
+                failedRecords = (firstCheckIn) ? clusterCheckIn(conn) : findFailedInstances(conn);
+    
+                if (failedRecords.size() > 0) {
+                    getLockHandler().obtainLock(conn, LOCK_TRIGGER_ACCESS);
+                    //getLockHandler().obtainLock(conn, LOCK_JOB_ACCESS);
+                    transOwner = true;
+    
+                    clusterRecover(conn, failedRecords);
+                    recovered = true;
+                }
+            }
+            
+            commitConnection(conn);
+        } catch (JobPersistenceException e) {
+            rollbackConnection(conn);
+            throw e;
+        } finally {
+            try {
+                releaseLock(LOCK_TRIGGER_ACCESS, transOwner);
+            } finally {
+                try {
+                    releaseLock(LOCK_STATE_ACCESS, transStateOwner);
+                } finally {
+                    cleanupConnection(conn);
+                }
+            }
+        }
+        firstCheckIn = false;
+        return recovered;
+```
+<a name="1lpZs"></a>
+#### 故障转移
+故障转移之前，当前调度器实例会先获取一个锁，防止此时此刻别的调度器也做同样的事情（估计会导致冲突或者重复调度），所谓的锁，就是在qrtz_locks中插入一条记录。<br />接下来，遍历每个失败的调度器实例，并从数据库中查询该调度器正在处理的trigger，修改他们的状态，然后将这些trigger重新放回到数据库中，这样调度器中存活的实例将继续处理这些trigger。<br />代码如下：
+```
+protected void clusterRecover(Connection conn, List<SchedulerStateRecord> failedInstances)
+        throws JobPersistenceException {
+        if (failedInstances.size() > 0) {
+            long recoverIds = System.currentTimeMillis();
+            logWarnIfNonZero(failedInstances.size(),
+                    "ClusterManager: detected " + failedInstances.size()
+                            + " failed or restarted instances.");
+            try {
+                for (SchedulerStateRecord rec : failedInstances) {
+                    getLog().info(
+                            "ClusterManager: Scanning for instance \""
+                                    + rec.getSchedulerInstanceId()
+                                    + "\"'s failed in-progress jobs.");
+                    List<FiredTriggerRecord> firedTriggerRecs = getDelegate()
+                            .selectInstancesFiredTriggerRecords(conn,
+                                    rec.getSchedulerInstanceId());
+                    int acquiredCount = 0;
+                    int recoveredCount = 0;
+                    int otherCount = 0;
+                    Set<TriggerKey> triggerKeys = new HashSet<TriggerKey>();
+                    for (FiredTriggerRecord ftRec : firedTriggerRecs) {
+                        TriggerKey tKey = ftRec.getTriggerKey();
+                        JobKey jKey = ftRec.getJobKey();
+                        triggerKeys.add(tKey);
+                        // release blocked triggers..
+                        if (ftRec.getFireInstanceState().equals(STATE_BLOCKED)) {
+                            getDelegate()
+                                    .updateTriggerStatesForJobFromOtherState(
+                                            conn, jKey,
+                                            STATE_WAITING, STATE_BLOCKED);
+                        } else if (ftRec.getFireInstanceState().equals(STATE_PAUSED_BLOCKED)) {
+                            getDelegate()
+                                    .updateTriggerStatesForJobFromOtherState(
+                                            conn, jKey,
+                                            STATE_PAUSED, STATE_PAUSED_BLOCKED);
+                        }
+                        // release acquired triggers..
+                        if (ftRec.getFireInstanceState().equals(STATE_ACQUIRED)) {
+                            getDelegate().updateTriggerStateFromOtherState(
+                                    conn, tKey, STATE_WAITING,
+                                    STATE_ACQUIRED);
+                            acquiredCount++;
+                        } else if (ftRec.isJobRequestsRecovery()) {
+                            // handle jobs marked for recovery that were not fully
+                            // executed..
+                            if (jobExists(conn, jKey)) {
+                                @SuppressWarnings("deprecation")
+                                SimpleTriggerImpl rcvryTrig = new SimpleTriggerImpl(
+                                        "recover_"
+                                                + rec.getSchedulerInstanceId()
+                                                + "_"
+                                                + String.valueOf(recoverIds++),
+                                        Scheduler.DEFAULT_RECOVERY_GROUP,
+                                        new Date(ftRec.getScheduleTimestamp()));
+                                rcvryTrig.setJobName(jKey.getName());
+                                rcvryTrig.setJobGroup(jKey.getGroup());
+                                rcvryTrig.setMisfireInstruction(SimpleTrigger.MISFIRE_INSTRUCTION_IGNORE_MISFIRE_POLICY);
+                                rcvryTrig.setPriority(ftRec.getPriority());
+                                JobDataMap jd = getDelegate().selectTriggerJobDataMap(conn, tKey.getName(), tKey.getGroup());
+                                jd.put(Scheduler.FAILED_JOB_ORIGINAL_TRIGGER_NAME, tKey.getName());
+                                jd.put(Scheduler.FAILED_JOB_ORIGINAL_TRIGGER_GROUP, tKey.getGroup());
+                                jd.put(Scheduler.FAILED_JOB_ORIGINAL_TRIGGER_FIRETIME_IN_MILLISECONDS, String.valueOf(ftRec.getFireTimestamp()));
+                                jd.put(Scheduler.FAILED_JOB_ORIGINAL_TRIGGER_SCHEDULED_FIRETIME_IN_MILLISECONDS, String.valueOf(ftRec.getScheduleTimestamp()));
+                                rcvryTrig.setJobDataMap(jd);
+                                rcvryTrig.computeFirstFireTime(null);
+                                storeTrigger(conn, rcvryTrig, null, false,
+                                        STATE_WAITING, false, true);
+                                recoveredCount++;
+                            } else {
+                                getLog()
+                                        .warn(
+                                                "ClusterManager: failed job '"
+                                                        + jKey
+                                                        + "' no longer exists, cannot schedule recovery.");
+                                otherCount++;
+                            }
+                        } else {
+                            otherCount++;
+                        }
+                        // free up stateful job's triggers
+                        if (ftRec.isJobDisallowsConcurrentExecution()) {
+                            getDelegate()
+                                    .updateTriggerStatesForJobFromOtherState(
+                                            conn, jKey,
+                                            STATE_WAITING, STATE_BLOCKED);
+                            getDelegate()
+                                    .updateTriggerStatesForJobFromOtherState(
+                                            conn, jKey,
+                                            STATE_PAUSED, STATE_PAUSED_BLOCKED);
+                        }
+                    }
+                    getDelegate().deleteFiredTriggers(conn,
+                            rec.getSchedulerInstanceId());
+                    // Check if any of the fired triggers we just deleted were the last fired trigger
+                    // records of a COMPLETE trigger.
+                    int completeCount = 0;
+                    for (TriggerKey triggerKey : triggerKeys) {
+                        if (getDelegate().selectTriggerState(conn, triggerKey).
+                                equals(STATE_COMPLETE)) {
+                            List<FiredTriggerRecord> firedTriggers =
+                                    getDelegate().selectFiredTriggerRecords(conn, triggerKey.getName(), triggerKey.getGroup());
+                            if (firedTriggers.isEmpty()) {
+                                if (removeTrigger(conn, triggerKey)) {
+                                    completeCount++;
+                                }
+                            }
+                        }
+                    }
+                    logWarnIfNonZero(acquiredCount,
+                            "ClusterManager: ......Freed " + acquiredCount
+                                    + " acquired trigger(s).");
+                    logWarnIfNonZero(completeCount,
+                            "ClusterManager: ......Deleted " + completeCount
+                                    + " complete triggers(s).");
+                    logWarnIfNonZero(recoveredCount,
+                            "ClusterManager: ......Scheduled " + recoveredCount
+                                    + " recoverable job(s) for recovery.");
+                    logWarnIfNonZero(otherCount,
+                            "ClusterManager: ......Cleaned-up " + otherCount
+                                    + " other failed job(s).");
+                    if (!rec.getSchedulerInstanceId().equals(getInstanceId())) {
+                        getDelegate().deleteSchedulerState(conn,
+                                rec.getSchedulerInstanceId());
+                    }
+                }
+            } catch (Throwable e) {
+                throw new JobPersistenceException("Failure recovering jobs: "
+                        + e.getMessage(), e);
+            }
+        }
+```
+<a name="M6iIP"></a>
+### 5.7 MisfireHandler线程
+此外，还有一个重要的线程叫做MisfireHandler。其作用是恢复那些过了调度时间但是仍然没有被调度到的trigger。恢复过程跟故障转移的过程类似。
+<a name="rqib8"></a>
+## 6. 使用方法
+<a name="00bC8"></a>
+### 6.1 如何构建一个JobDetail？
+```java
+JobBuilder.newJob()
+				   .ofType(QueryJob.class)
+				   .withIdentity("jobName", "jobGroup")
+				   .requestRecovery()
+				   .storeDurably()
+				   .withDescription("job description")
+				   .build();
+```
+说明：QueryJob.class是实现了Job接口的类，jobName、jobGroup的用处不详，job description是job的简单描述信息
+<a name="E8KUA"></a>
+### 6.2如何构建一个Trigger？
+```
+TriggerBuilder.newTrigger()
+				.forJob(jobDetail)
+				.withIdentity("jobName", "jobGroup")
+				.withSchedule(CronScheduleBuilder.cronSchedule(queryEntity.getCronExpr()))
+				.withDescription("job description"))
+				.startAt("开始时间")
+				.endAt("结束时间")
+			    .build();
+```
+
+ 
+<a name="eJx8H"></a>
+### 6.3 如何构建并启动一个Scheduler？
+```
+Properties props = new Properties();
+    ...
+schedulerFactory.initialize(props);
+			scheduler = schedulerFactory.getScheduler();
+			scheduler.start()
+```
+ <br />props中的参数很多，可以通过配置文件配置，配置项有下面这些：
+```
+public static final String QUARTZ_SCHEDULER_INSTANCE_NAME = "org.quartz.scheduler.instanceName";
+	public static final String QUARTZ_SCHEDULER_INSTANCE_NAME_DEFAULT = "PRIESTSQL";
+	public static final String QUARTZ_SCHEDULER_INSTANCE_ID = "org.quartz.scheduler.instanceId";
+	public static final String QUARTZ_SCHEDULER_INSTANCE_ID_DEFAULT = "AUTO";
+	public static final String QUARTZ_JOB_GROUP_NAME = "org.quartz.job.group.name";
+	public static final String QUARTZ_JOB_GROUP_NAME_DEFAULT = QUARTZ_SCHEDULER_INSTANCE_ID_DEFAULT;
+	public static final String QUARTZ_SCHEDULER_INSTANCE_ID_GENERATOR = "org.quartz.scheduler.instanceIdGenerator.class";
+	public static final String QUARTZ_SCHEDULER_INSTANCE_ID_GENERATOR_DEFAULT = "org.quartz.simpl.SimpleInstanceIdGenerator";
+	public static final String QUARTZ_SCHEDULER_THREAD_NAME = "org.quartz.scheduler.threadName";
+	public static final String QUARTZ_SCHEDULER_THREAD_NAME_DEFAULT = "QUARTZ_SCHEDULER";
+	public static final String QUARTZ_THREAD_POOL_CLASS = "org.quartz.threadPool.class";
+	public static final String QUARTZ_THREAD_POOL_CLASS_DEFAULT = "com.xxx.xxx.scheduler.SchedulerThreadPool";
+	public static final String QUARTZ_THREAD_POOL_CORE = "org.quartz.threadPool.core";
+	public static final int QUARTZ_THREAD_POOL_CORE_DEFAULT = Runtime.getRuntime().availableProcessors();
+	public static final String QUARTZ_THREAD_POOL_MAX = "org.quartz.threadPool.max";
+	public static final int QUARTZ_THREAD_POOL_MAX_DEFAULT = Runtime.getRuntime().availableProcessors() * 2;
+	public static final String QUARTZ_JOBSTORE_CLASS = "org.quartz.jobStore.class";
+	public static final String QUARTZ_JOBSTORE_CLASS_DEFAULT = "org.quartz.impl.jdbcjobstore.JobStoreTX";
+	public static final String QUARTZ_JOBSTORE_USE_PROPERTIES = "org.quartz.jobStore.useProperties";
+	public static final boolean QUARTZ_JOBSTORE_USE_PROPERTIES_DEFAULT = false;
+	public static final String QUARTZ_JOBSTORE_MISFIRE_THRESHOLD = "org.quartz.jobStore.misfireThreshold";
+	public static final long QUARTZ_JOBSTORE_MISFIRE_THRESHOLD_DEFAULT = 5 * 60 * 1000;
+	public static final String QUARTZ_JOBSTORE_IS_CLUSTER = "org.quartz.jobStore.isClustered";
+	public static final boolean QUARTZ_JOBSTORE_IS_CLUSTER_DEFAULT = true;
+	public static final String QUARTZ_JOBSTORE_DRIVER_DELEGATE_CLASS = "org.quartz.jobStore.driverDelegateClass";
+	public static final String QUARTZ_JOBSTORE_DRIVER_DELEGATE_CLASS_DEFAULT = "org.quartz.impl.jdbcjobstore.StdJDBCDelegate";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE = "org.quartz.jobStore.dataSource";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_DEFAULT = "priestsql";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_DRIVER = "org.quartz.dataSource.priestsql.driver";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_DRIVER_DEFAULT = "com.mysql.jdbc.Driver";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_URL = "org.quartz.dataSource.priestsql.URL";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_URL_DEFAULT = "jdbc:mysql://192.168.100.136:3306/priestsql_independent?autoReconnect=true&useUnicode=true&characterEncoding=UTF-8";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_USER = "org.quartz.dataSource.priestsql.user";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_USER_DEFAULT = "root";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_PASSWORD = "org.quartz.dataSource.priestsql.password";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_PASSWORD_DEFAULT = "password";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_MAX_CONNECTIONS = "org.quartz.dataSource.priestsql.maxConnections";
+	public static final int QUARTZ_JOBSTORE_DATASOURCE_MAX_CONNECTIONS_DEFAULT = 20;
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_VALIDATION_QUERY = "org.quartz.dataSource.priestsql.validationQuery";
+	public static final String QUARTZ_JOBSTORE_DATASOURCE_VALIDATION_QUERY_DEFAULT = "select 0 from dual";
+	public static final String WAIT_QUARTZ_SCHEDULER_TASKS_COMPLETED = "wait.quartz.scheduler.tasks.completed";
+	public static final boolean WAIT_QUARTZ_SCHEDULER_TASKS_COMPLETED_DEFAULT = false;
+```
+其中比较重要的方面有：
+
+- 线程池配置
+- 作业调度信息存储配置
+
+ 
+<a name="dqc5Y"></a>
+## 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+<br /> 
+
+ 
+
+ 
+
+ 
+
+<br /> 
+
+<br /> 
+
+<br /> 
+
+ 
+
+ 
+
+ 
+
+ 
+
+
