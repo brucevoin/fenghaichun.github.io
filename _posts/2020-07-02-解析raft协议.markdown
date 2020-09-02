@@ -4,7 +4,7 @@ title: "解析raft协议"
 subtitle: ""
 date: 2020-07-02
 author: fenghaichun
-category: computer
+category: 分布式理论
 tags: 计算机
 finished: true
 ---
