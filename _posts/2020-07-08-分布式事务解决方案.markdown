@@ -1,0 +1,378 @@
+---
+layout: post
+title: "分布式事务解决方案"
+subtitle: ""
+date: 2020-07-02
+author: fenghaichun
+category: 分布式理论
+tags: 分布式
+finished: true
+---
+
+## 1. 概述
+
+总的来说，有以下几种分布式事务解决方案：
+
+- 全局事务
+- 基于可靠消息的分布式事务
+- TCC
+- 最大努力通知
+
+
+
+## 2. 全局事务
+
+全局事务基于 DTP 模型实现。DTP 是由 X/Open 组织提出 的⼀种分布式事务模型——X/Open Distributed Transaction Processing Reference Model。
+
+### 2.1 DTP模型
+
+DTP模型首先定义了分布式事务中的三个角色：
+
+- RM（Rource Manager）：资源管理器，一般就是MySql。
+- AP（application）：应用程序，就是我们通常的业务应用。
+- TM（Transaction Manager）：事务管理器，分布式事务的协调者，应用程序通过他调用TM的接口完成事务，TM与RM互相交换信息，决定事务的状态。
+
+其原理如下：
+
+<img src="/img/分布式事务.assets/image-20200818114746716.png" alt="image-20200818114746716" style="zoom:50%;" />
+
+注意，DTP模型本身没有规定使用两阶段还是三阶段提交事务，DTP模型只规定了各个角色的接口规范（个人理解）。
+
+### 2.2 LCN事务框架
+
+https://www.codingapi.com/docs/txlcn-preface/
+
+#### 2.2.1 框架原理
+
+<img src="/img/分布式事务.assets/image-20200818114057470.png" alt="image-20200818114057470" style="zoom:50%;" />
+
+TX-LCN由两大模块组成, TxClient、TxManager，TxClient作为模块的依赖框架，提供TX-LCN的标准支持，TxManager作为分布式事务的控制放。事务发起方或者参与反都由TxClient端来控制。
+
+核心步骤：
+
+- 创建事务组
+  是指在事务发起方开始执行业务代码之前先调用TxManager创建事务组对象，然后拿到事务标示GroupId的过程。
+- 加入事务组
+  添加事务组是指参与方在执行完业务方法以后，将该模块的事务信息通知给TxManager的操作。
+- 通知事务组
+  是指在发起方执行完业务代码以后，将发起方执行结果状态通知给TxManager,TxManager将根据事务最终状态和事务组的信息来通知相应的参与模块提交或回滚事务，并返回结果给事务发起方。
+
+底层原理：
+
+LCN模式是通过代理Connection的方式实现对本地事务的操作，然后在由TxManager统一协调控制事务。当本地事务提交回滚或者关闭连接时将会执行假操作，该代理的连接将由LCN连接池管理。
+
+<img src="/img/分布式事务.assets/image-20200818115224650.png" alt="image-20200818115224650" style="zoom:50%;" />
+
+#### 2.2.2 使用
+
+
+
+## 3. 基于可靠消息的分布式事务
+
+### 3.1 原理
+
+基于可靠消息的分布式事务的本只是，将本地事务与发送消息这两个操作作为一个事务单元，要么都成功要么都失败，其中消息中间件充当了事务协调者的角色。
+
+<img src="/img/分布式事务.assets/image-20200818153037142.png" alt="image-20200818153037142" style="zoom:50%;" />
+
+### 3.2 RocketMQ的实现
+
+<img src="/img/分布式事务.assets/image-20200818154958326.png" alt="image-20200818154958326" style="zoom:50%;" />
+
+
+
+### 3.3 使用
+
+实际操作的时候要注意两点：
+
+- 本地事务依然需要一个表记录事务执行情况
+- 前端调用的时候只发送事务消息即可
+
+#### 3.3.1 总体流程：
+
+<img src="/img/分布式事务.assets/image-20200818170603103.png" alt="image-20200818170603103" style="zoom:50%;" />
+
+比如，我们有个订单服务，在创建订单的同时需要调用积分服务为用户增加积分，所以要求下订单跟增加积分在一个事务内执行。
+
+#### 3.3.2 代码实现
+
+1. 前端调用
+
+   前端调用请求走到controller：
+
+   ```
+   @RestController
+   public class OrderController {
+   
+       @Autowired
+       OrderService orderService;
+       Logger logger = LoggerFactory.getLogger(this.getClass());
+   
+       @PostMapping("/create_order")
+       public void createOrder(@RequestBody OrderDTO order) throws MQClientException {
+           logger.info("接收到订单数据：{}",order.getCommodityCode());
+           orderService.createOrder(order);
+       }
+   }
+   
+   ```
+
+2. 订单service
+
+   注意前端调用的后面那个createOrder，改方法只是将订单基本数据发送到MQ，此时发送的消息并不能被积分服务消费到，而是暂存在MQ的broker中。
+
+   
+
+   ```
+   @Service
+   public class OrderServiceImpl implements OrderService {
+       @Autowired
+       OrderMapper orderMapper;
+       @Autowired
+       TransactionLogMapper transactionLogMapper;
+       @Autowired
+       TransactionProducer producer;
+   Snowflake snowflake = new Snowflake(1,1);
+   Logger logger = LoggerFactory.getLogger(this.getClass());
+   
+   //执行本地事务时调用，将订单数据和事务日志写入本地数据库
+   @Transactional
+   @Override
+   public void createOrder(OrderDTO orderDTO,String transactionId){
+   
+       //1.创建订单
+       Order order = new Order();
+       BeanUtils.copyProperties(orderDTO,order);
+       orderMapper.createOrder(order);
+   
+       //2.写入事务日志
+       TransactionLog log = new TransactionLog();
+       log.setId(transactionId);
+       log.setBusiness("order");
+       log.setForeignKey(String.valueOf(order.getId()));
+       transactionLogMapper.insert(log);
+   
+       logger.info("订单创建完成。{}",orderDTO);
+   }
+   
+   //前端调用，只用于向RocketMQ发送事务消息
+   @Override
+   public void createOrder(OrderDTO order) throws MQClientException {
+       order.setId(snowflake.nextId());
+       order.setOrderNo(snowflake.nextIdStr());
+       producer.send(JSON.toJSONString(order),"order");
+   }
+   }
+   ```
+
+3. #### OrderTransactionListener
+
+   TransactionListener由RocketMQ回调，该接口里有两个方法，一个用于执行本地事务，一个用于检查本地事务执行状态。
+
+   
+
+   执行事务的话就是调用OrderService的创建订单接口，查看上面的OrderServiceImpl的代码可以知道，在createOrder方法中，将持久化订单到数据库的操作与记录事务日志的操作放在了一个本地事务里，而为了记录事务日志，我们必须创建一个数据库表，用于记录事务日志。此外，当MQ调用此回调方法的时候还能得到本地事务的执行结构，MQ可根据此结构决定是否正式提交消息。
+
+   
+
+   检查事务执行状态，那就是从事务日志里查询对应的事务日志记录，如果查询到里，说明事务执行成功了，MQ会正式提交到消息队列，然后积分服务就能够消费到了。
+
+   
+
+   默认情况下，如果MQ尝试多次后依然无法获取本地事务的执行状态，则会丢弃掉暂存的消息。
+
+   
+
+   @Component
+   public class OrderTransactionListener implements TransactionListener {
+
+   ```
+   @Autowired
+   OrderService orderService;
+   
+   @Autowired
+   TransactionLogService transactionLogService;
+   
+   Logger logger = LoggerFactory.getLogger(this.getClass());
+   
+   @Override
+   public LocalTransactionState executeLocalTransaction(Message message, Object o) {
+       logger.info("开始执行本地事务....");
+       LocalTransactionState state;
+       try{
+           String body = new String(message.getBody());
+           OrderDTO order = JSONObject.parseObject(body, OrderDTO.class);
+           orderService.createOrder(order,message.getTransactionId());
+           state = LocalTransactionState.COMMIT_MESSAGE;
+           logger.info("本地事务已提交。{}",message.getTransactionId());
+       }catch (Exception e){
+           logger.info("执行本地事务失败。{}",e);
+           state = LocalTransactionState.ROLLBACK_MESSAGE;
+       }
+       return state;
+   }
+   
+   @Override
+   public LocalTransactionState checkLocalTransaction(MessageExt messageExt) {
+       logger.info("开始回查本地事务状态。{}",messageExt.getTransactionId());
+       LocalTransactionState state;
+       String transactionId = messageExt.getTransactionId();
+       if (transactionLogService.get(transactionId)>0){
+           state = LocalTransactionState.COMMIT_MESSAGE;
+       }else {
+           state = LocalTransactionState.UNKNOW;
+       }
+       logger.info("结束本地事务状态查询：{}",state);
+       return state;
+   }
+   }
+   ```
+
+
+   #### 3.3.3. 时序图
+
+   
+
+   <img src="/img/分布式事务.assets/image-20200818173035879.png" alt="image-20200818173035879" style="zoom:50%;" />
+
+参考https://juejin.im/post/6844904099993878536
+
+
+
+## 4. 最大努力通知
+
+最⼤努⼒通知也被称为定期校对，其实在⽅案⼆中已经包含。这种⽅案也 需要消息中间件的参与。
+
+### 4.1 原理
+
+1. 上游
+
+   最大努力通知在事务的发起方（上游业务系统）依然需要一张表记录本地事务日志（本地消息），并将插入事务日志记录与本地事务放在一个事务里执行，然后采用某种方式（比如定时器）将本地事务日志中的消息发送给MQ，如果发送失败则进行有限次的重试（超过限制次数需要人工处理）。
+
+2. MQ
+
+   MQ负责将消息推送给消费者（下游系统），如果消费失败则有限次的重试，超出限制则进入死信队列（并提供死信队列的查询接口）。
+
+3. 下游
+
+   下游系统收到消息后执行本地事务，在本地事务执行完成后再回复MQ消息已经成功消费。其次下游系统定时查询死信队列的消息，确保发送到MQ的消息全部被消费。
+
+### 4.2 使用建议
+
+对于不⽀持事务型消息的消息中间件，如果要实现分布式事务 的话，就可以采⽤这种⽅式。它能够通过重试机制 + 定期校 对实现分布式事务，但相⽐于第⼆种⽅案，它达到数据⼀致性 的周期较⻓，⽽且还需要在上游系统中实现消息重试发布机 制，以确保消息成功发布给消息中间件，这⽆疑增加了业务系统的开发成本，使得业务系统不够纯粹，并且这些额外的业务 逻辑⽆疑会占⽤业务系统的硬件资源，从⽽影响性能。 因此，尽量选择⽀持事务型消息的消息中间件来实现分布式事 务，如 RocketMQ。
+
+## 5. TCC模型
+
+### 5.1 TCC模型原理
+
+TCC 即为 Try Confirm Cancel，它属于补偿型分布式事务。 顾名思义，TCC 实现分布式事务⼀共有三个步骤： 下⾯以⼀个转账的例⼦来解释下 TCC 实现分布式事务的过 程。 
+
+- Try：尝试待执⾏的业务 这个过程并未执⾏业务，只是完成所有业务的⼀致性 检查，并预留好执⾏所需的全部资源 
+- Confirm：执⾏业务 这个过程真正开始执⾏业务，由于 Try 阶段已经完成 了⼀致性检查，因此本过程直接执⾏，⽽不做任何检 查。并且在执⾏的过程中，会使⽤到 Try 阶段预留的 业务资源。
+- Cancel：取消执⾏的业务 若业务执⾏失败，则进⼊ Cancel 阶段，它会释放所 有占⽤的业务资源，并回滚 Confirm 阶段执⾏的操 作。
+
+假设⽤户 A ⽤他的账户余额给⽤户 B 发⼀个 100 元的红包，并且余额系统和红包系统是两个独⽴的 系统。
+
+Try：
+
+- 创建⼀条转账流⽔，并将流⽔的状态设为交易中 
+- 将⽤户 A 的账户中扣除 100 元（预留业务资源） Try 成功之后，便进⼊ Confirm 阶段
+- Try 过程发⽣任何异常，均进⼊ Cancel 阶段
+
+confirm：
+
+- 向 B ⽤户的红包账户中增加 100 元
+- 将流⽔的状态设为交易已完成
+- Confirm 过程发⽣任何异常，均进⼊ Cancel 阶段
+- Confirm 过程执⾏成功，则该事务结束
+
+cancel：
+
+- 将⽤户 A 的账户增加 100 元
+- 将流⽔的状态设为交易失败
+
+TCC模型的要点是通过引入中间状态将原来一次性完成业务功能的接口拆分成三个，分别实现try（锁定或者冻结资源），confirm（确认），cancel（回退）语义。
+
+### 5.2 TCC模型事务框架
+
+#### 5.2.1 byteTCC
+
+参考https://www.cnblogs.com/jajian/p/10014145.html
+
+## 6. seata
+
+http://seata.io/zh-cn/docs/overview/what-is-seata.html
+
+### 6.1 概述
+
+Seata 是一款开源的分布式事务解决方案，致力于提供高性能和简单易用的分布式事务服务。Seata 将为用户提供了 AT、TCC、SAGA 和 XA 事务模式，为用户打造一站式的分布式解决方案。
+
+seata采用两阶段提交协议：
+
+两阶段提交协议的演变：
+
+- 一阶段：业务数据和回滚日志记录在同一个本地事务中提交，释放本地锁和连接资源。
+- 二阶段：
+  - 提交异步化，非常快速地完成。
+  - 回滚通过一阶段的回滚日志进行反向补偿。
+
+seata的限制：
+
+- 基于支持本地 ACID 事务的关系型数据库。
+- Java 应用，通过 JDBC 访问数据库。
+
+### 6.2 原理
+
+#### 6.2.1 seata框架中的角色
+
+Seata框架中一个分布式事务包含3中角色：
+
+- **Transaction Coordinator (TC)： 事务协调器，维护全局事务的运行状态，负责协调并驱动全局事务的提交或回滚。**
+- **Transaction Manager (TM)： 控制全局事务的边界，负责开启一个全局事务，并最终发起全局提交或全局回滚的决议。**
+- **Resource Manager (RM)： 控制分支事务，负责分支注册、状态汇报，并接收事务协调器的指令，驱动分支（本地）事务的提交和回滚。**
+
+<img src="/img/分布式事务.assets/image-20200824110529154.png" alt="image-20200824110529154" style="zoom:50%;" />
+
+注意seata框架中的RM运行则应用侧，而XA协议的RM则运行在数据库侧。
+
+#### 6.2.2 事务执行流程
+
+一个分布式事务的运行流程：
+
+- **TM 向 TC 申请开启一个全局事务，全局事务创建成功并生成一个全局唯一的 XID。**
+
+- **XID 在微服务调用链路的上下文中传播。**（问题：如何传播）
+
+- **RM 向 TC 注册分支事务，接着执行这个分支事务并提交（重点：RM在第一阶段就已经执行了本地事务的提交/回滚），最后将执行结果汇报给TC。**
+
+- **TM 根据 TC 中所有的分支事务的执行情况，发起全局提交或回滚决议。**
+
+- **TC 调度 XID 下管辖的全部分支事务完成提交或回滚请求。**
+
+
+
+详细流程：
+
+下面是一个Seata中一个分布式事务执行的详细过程：
+
+1. 首先TM 向 TC 申请开启一个全局事务，全局事务创建成功并生成一个全局唯一的 XID。
+2. XID 在微服务调用链路的上下文中传播。
+3. RM 开始执行这个分支事务，RM首先解析这条SQL语句，生成对应的UNDO_LOG记录。
+4. RM在同一个本地事务中执行业务SQL和UNDO_LOG数据的插入。在提交这个本地事务前，RM会向TC申请关于这条记录的全局锁。如果申请不到，则说明有其他事务也在对这条记录进行操作，因此它会在一段时间内重试，重试失败则回滚本地事务，并向TC汇报本地事务执行失败。
+5. RM在同一个本地事务中执行业务SQL和UNDO_LOG数据的插入。在提交这个本地事务前，RM会向TC申请关于这条记录的全局锁。如果申请不到，则说明有其他事务也在对这条记录进行操作，因此它会在一段时间内重试，重试失败则回滚本地事务，并向TC汇报本地事务执行失败。
+6. TC根据所有的分支事务执行结果，向RM下发提交或回滚命令。
+7. RM如果收到TC的提交命令，首先立即释放相关记录的全局锁，然后把提交请求放入一个异步任务的队列中，马上返回提交成功的结果给 TC。异步队列中的提交请求真正执行时，只是删除相应 UNDO LOG 记录而已。
+8. RM如果收到TC的回滚命令，则会开启一个本地事务，通过 XID 和 Branch ID 查找到相应的 UNDO LOG 记录。将 UNDO LOG 中的后镜与当前数据进行比较，如果有不同，说明数据被当前全局事务之外的动作做了修改。这种情况，需要根据配置策略来做处理。否则，根据 UNDO LOG 中的前镜像和业务 SQL 的相关信息生成并执行回滚的语句并执行，然后提交本地事务达到回滚的目的，最后释放相关记录的全局锁。
+
+
+
+#### 6.2.3 事务隔离级别
+
+很明显，seata的事务隔离等级很低，是读为提交。如果需要达到读提交则需要将读的sql语句修改为select for update，seata的RM针对select for update做了特别的处理，当遇到select for update语句时，会尝试获取行的全局锁，这时候假如有一个seata事务正在修改要select的数据，则当前select会被阻塞（不断重试），直到获取到全局锁。
+
+### 6.3 使用
+
+ https://github.com/seata/seata-samples.git 
+
+常见场景：springcloud-eureka-feign-mybatis-seata/
+
